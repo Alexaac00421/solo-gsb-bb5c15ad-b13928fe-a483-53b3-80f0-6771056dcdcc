@@ -16,6 +16,7 @@ from typing import Any, Optional
 from .schemas import (
     ValidationError,
     _clean_identifier,
+    _validate_capacity,
     _validate_seconds,
     _validate_stairs,
 )
@@ -159,6 +160,14 @@ def collect_graph_errors(payload: Any) -> tuple[list[dict], Optional[dict]]:
             except ValidationError as exc:
                 _add(errors, source, f"{where}.has_stairs", i, str(exc))
 
+            # 通行容量：缺省/null 不限；出现时必须为正整数
+            capacity = None
+            if "capacity" in raw:
+                try:
+                    capacity = _validate_capacity(raw["capacity"], where)
+                except ValidationError as exc:
+                    _add(errors, source, f"{where}.capacity", i, str(exc))
+
             windows = _collect_reverse_windows(errors, raw, where, i)
 
             edges.append(
@@ -168,6 +177,7 @@ def collect_graph_errors(payload: Any) -> tuple[list[dict], Optional[dict]]:
                     "dst": endpoints["to"],
                     "seconds": seconds,
                     "has_stairs": has_stairs,
+                    "capacity": capacity,
                     "reverse_windows": windows,
                 }
             )

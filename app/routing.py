@@ -80,6 +80,7 @@ class Edge:
     dst: str
     seconds: int
     has_stairs: bool
+    capacity: Optional[int] = None  # None 表示该路段不限容量
 
 
 class Segment(NamedTuple):
@@ -161,13 +162,18 @@ def _overlaps(enter: int, leave: int, start: int, end: int) -> bool:
 
 
 class RouteEngine:
-    def __init__(self, snapshot: Snapshot):
+    def __init__(self, snapshot: Snapshot, occupancy: Optional[dict] = None):
+        """``occupancy`` 为 ``{edge_id: [(enter, leave, people), ...]}``
+        形式的**已确认行程占用**（按半开区间），仅用于容量确认规划；
+        缺省（普通路线查询）时容量约束完全不生效，引擎语义与旧版一致。
+        """
         self.version_id = snapshot.version_id
         self._adj: dict[str, list[Edge]] = defaultdict(list)
         self._rev_adj: dict[str, list[Edge]] = defaultdict(list)
         self._edges: dict[str, Edge] = {}
         for row in snapshot.edges:
-            edge = Edge(row.id, row.src, row.dst, row.seconds, row.has_stairs)
+            edge = Edge(row.id, row.src, row.dst, row.seconds, row.has_stairs,
+                        getattr(row, "capacity", None))
             if edge.id in self._edges:
                 raise ValueError(f"路段编号在版本内重复: {edge.id}")
             self._edges[edge.id] = edge
@@ -192,6 +198,14 @@ class RouteEngine:
         for intervals in self._reverse_windows.values():
             intervals.sort()
 
+        # 已确认行程占用（容量确认专用）：{edge_id: [(enter, leave, people)]}
+        # None 表示普通路线查询模式：容量字段完全不参与，保持旧语义。
+        self._occupancy: Optional[dict[str, list[tuple[int, int, int]]]] = occupancy
+        self._capacity_enabled = occupancy is not None
+        # 容量受阻区间缓存：{(edge_id, people): [(block_start, block_end)]}
+        # 区间由扫描线按“占用人数 + people > capacity”合并而成。
+        self._capacity_blocks: dict[tuple[str, int], list[tuple[int, int]]] = {}
+
     def _options(self, node: str, avoid_stairs: bool) -> list[tuple[Edge, bool]]:
         """从 ``node`` 可扩展的 ``(路段, 是否反向)`` 列表。
 
@@ -211,6 +225,71 @@ class RouteEngine:
         options.sort(key=lambda item: (item[0].id, item[1]))
         return options
 
+    def _capacity_blocked_intervals(self, edge: Edge, people: int) -> list[tuple[int, int]]:
+        """该路段对 ``people`` 人团体不可进入的半开时间区间并集。
+
+        扫描线合并该边全部已确认行程的半开占用：当某个时刻
+        ``现有占用人数 + people > capacity`` 时该时刻不可进入，连续的
+        不可进入时刻合并为半开区间 ``[start, end)``。调用前应已排除
+        ``people > capacity``（该路对该团体恒不可用）与不限容量路段。
+        """
+        key = (edge.id, people)
+        cached = self._capacity_blocks.get(key)
+        if cached is not None:
+            return cached
+        blocks: list[tuple[int, int]] = []
+        usages = self._occupancy.get(edge.id, ())
+        if usages:
+            events: list[tuple[int, int]] = []
+            for enter, leave, party in usages:
+                # 半开：enter 时刻 +party，leave 时刻 -party（恰在 leave 进入不冲突）
+                events.append((enter, party))
+                events.append((leave, -party))
+            # 同一时刻先结算离开再计入进入，保证首尾相接的两段在端点不超额
+            events.sort(key=lambda ev: (ev[0], ev[1]))
+            load = 0
+            block_start: Optional[int] = None
+            for ts, delta in events:
+                load += delta
+                if load + people > edge.capacity:
+                    if block_start is None:
+                        block_start = ts
+                elif block_start is not None:
+                    blocks.append((block_start, ts))
+                    block_start = None
+        self._capacity_blocks[key] = blocks
+        return blocks
+
+    def _capacity_clear_at(self, edge: Edge, t: int, people: int) -> Optional[int]:
+        """容量约束下最早可进入时刻（不早于 ``t``）。
+
+        与封闭记录同口径：候选通行区间为 ``[t, t + seconds)``，只要它与
+        任一容量受阻半开区间重叠，就把进入时刻推迟到该受阻区间结束后
+        重检（受阻区间按开始时刻排序，逐条扫描即可）。
+
+        返回值：
+        - 普通路线查询模式（未提供占用）或路段不限容量：直接返回 ``t``；
+        - 找到可行时刻：返回该时刻（>= ``t``）；
+        - 团体人数超过路段容量（该路对该团体恒不可用）：返回 ``None``。
+        """
+        if not self._capacity_enabled:
+            return t  # 普通路线查询：容量字段完全不参与
+        capacity = edge.capacity
+        if capacity is None:
+            return t  # 不限容量
+        if people > capacity:
+            return None
+        blocks = self._capacity_blocked_intervals(edge, people)
+        enter = t
+        for start, end in blocks:
+            if end <= enter:
+                continue
+            if start >= enter + edge.seconds:
+                break  # 已按 start 排序，后面的区间不可能再重叠
+            if _overlaps(enter, enter + edge.seconds, start, end):
+                enter = end  # 在节点等到该受阻区间结束，继续检查后续区间
+        return enter
+
     def earliest_departure(self, edge: Edge, ready_at: int) -> int:
         """原方向在 ``ready_at`` 或之后最早可以进入该路段的时刻（兼容接口）。
 
@@ -222,20 +301,28 @@ class RouteEngine:
             raise NoRouteError("内部错误：原方向无可用时间窗")
         return enter
 
-    def earliest_enter(self, edge: Edge, ready_at: int, reverse: bool) -> Optional[int]:
+    def earliest_enter(
+        self, edge: Edge, ready_at: int, reverse: bool, party_size: int = 1
+    ) -> Optional[int]:
         """在 ``ready_at`` 或之后，按指定方向最早可以进入该路段的时刻。
 
-        同时满足两类约束：
+        同时满足三类约束：
 
         1. 封闭记录：整个通行区间 ``[enter, enter + seconds)`` 不得与该边
            任何封闭区间重叠；可在节点等待封闭结束；
         2. 反向时间窗：反向通行的进入时刻必须落在某个
            ``[win_start, win_end)`` 内，原方向的进入时刻必须落在所有
            时间窗之外（等待到窗结束）。未配置反向窗时两个方向都只有
-           原方向可行。
+           原方向可行；
+        3. 通行容量（仅容量确认规划传入占用时生效）：``[enter, leave)``
+           内该边既有占用人数与本团人数之和不得超过容量，可在节点等待
+           前段占用离开（半开区间端点相接允许）。人数本身超过容量的
+           路段对该团体恒不可用，返回 ``None``。
 
-        返回最早进入时刻；该方向此后无可用时间窗时返回 ``None``。
-        方向只按进入时刻判定，故等待封闭而越过窗边界时需要重新选向。
+        返回最早进入时刻；该方向此后无可行时刻时返回 ``None``。
+        方向只按进入时刻判定，故等待封闭/容量而越过窗边界时需要重新选向。
+        该函数关于 ``ready_at`` 单调非降（FIFO）：越晚就绪只会被推迟到
+        同一个或更晚的可行时刻。
         """
         t = ready_at
         windows = self._reverse_windows.get(edge.id, ())
@@ -255,34 +342,45 @@ class RouteEngine:
                 continue  # 越过封闭结束时刻后，可能也越过了窗边界，重检
             # 2) 反向时间窗约束（窗对两个方向都强制选向）
             if not windows:
-                return None if reverse else t
-            containing = None  # t 所在的窗（半开）
-            next_start = None  # t 之后第一个开始的窗
-            for win_start, win_end in windows:
-                if win_end <= t:
-                    continue
-                if win_start <= t < win_end:
-                    containing = (win_start, win_end)
-                elif win_start > t:
-                    next_start = win_start
-                    break  # 已按 start 排序
-            if reverse:
-                if containing is not None:
-                    return t
-                if next_start is None:
-                    return None  # 之后再无反向窗
-                t = next_start  # 在节点等待下一反向窗开放
+                candidate = None if reverse else t
             else:
-                if containing is None:
-                    return t
-                t = containing[1]  # 窗内原方向禁行，等待窗结束
-            # 跨越窗边界后重新检查封闭区间
+                containing = None  # t 所在的窗（半开）
+                next_start = None  # t 之后第一个开始的窗
+                for win_start, win_end in windows:
+                    if win_end <= t:
+                        continue
+                    if win_start <= t < win_end:
+                        containing = (win_start, win_end)
+                    elif win_start > t:
+                        next_start = win_start
+                        break  # 已按 start 排序
+                if reverse:
+                    if containing is not None:
+                        candidate = t
+                    elif next_start is None:
+                        return None  # 之后再无反向窗
+                    else:
+                        t = next_start  # 在节点等待下一反向窗开放
+                        continue
+                else:
+                    if containing is None:
+                        candidate = t
+                    else:
+                        t = containing[1]  # 窗内原方向禁行，等待窗结束
+                        continue
+            # 3) 容量约束（封闭与方向都已满足的候选时刻）
+            cleared = self._capacity_clear_at(edge, candidate, party_size)
+            if cleared is None:
+                return None  # 人数超过路段容量，该方向恒不可用
+            if cleared == candidate:
+                return candidate
+            t = cleared  # 等待容量受阻区间结束后，重检封闭/窗边界
 
     # ------------------------------------------------------------------
     # 第一阶段：最早到达时刻
     # ------------------------------------------------------------------
     def _earliest_arrival_map(
-        self, origin: str, departure: int, avoid_stairs: bool
+        self, origin: str, departure: int, avoid_stairs: bool, party_size: int = 1
     ) -> dict[str, int]:
         dist: dict[str, int] = {origin: departure}
         heap: list[tuple[int, str]] = [(departure, origin)]
@@ -291,7 +389,7 @@ class RouteEngine:
             if t != dist[u]:
                 continue
             for edge, reversed_dir in self._options(u, avoid_stairs):
-                enter = self.earliest_enter(edge, t, reversed_dir)
+                enter = self.earliest_enter(edge, t, reversed_dir, party_size)
                 if enter is None:
                     continue
                 v = edge.src if reversed_dir else edge.dst
@@ -332,6 +430,7 @@ class RouteEngine:
         departure: int,
         avoid_stairs: bool,
         deadline: int,
+        party_size: int = 1,
     ) -> tuple[str, ...]:
         """在所有“到达终点不晚于 deadline”的路线中取序列字典序最小者。
 
@@ -351,7 +450,7 @@ class RouteEngine:
                 continue  # 已被支配后移除的过期标签
 
             for edge, reversed_dir in self._options(u, avoid_stairs):
-                enter = self.earliest_enter(edge, t, reversed_dir)
+                enter = self.earliest_enter(edge, t, reversed_dir, party_size)
                 if enter is None:
                     continue
                 v = edge.src if reversed_dir else edge.dst
@@ -385,19 +484,22 @@ class RouteEngine:
         departure: int,
         avoid_stairs: bool = False,
         stops: tuple[Stop, ...] = (),
+        party_size: int = 1,
     ) -> Route:
         if stops:
-            return self._plan_with_stops(origin, destination, departure, avoid_stairs, stops)
+            return self._plan_with_stops(
+                origin, destination, departure, avoid_stairs, stops, party_size
+            )
 
-        dist = self._earliest_arrival_map(origin, departure, avoid_stairs)
+        dist = self._earliest_arrival_map(origin, departure, avoid_stairs, party_size)
         if destination not in dist:
             raise NoRouteError(
-                "在当前步道图与封闭记录下不存在可行路线"
+                "在当前步道图、封闭记录与容量占用下不存在可行行程"
                 + ("（已避开台阶路段）" if avoid_stairs else "")
             )
         deadline = dist[destination]
         best_seq = self._lex_smallest(
-            origin, destination, departure, avoid_stairs, deadline
+            origin, destination, departure, avoid_stairs, deadline, party_size
         )
 
         segments: list[Segment] = []
@@ -407,7 +509,7 @@ class RouteEngine:
             edge = self._edges[edge_id]
             # 方向按当前所在节点判定（重放进入时刻与搜索阶段一致）
             reversed_dir = current == edge.dst and current != edge.src
-            enter = self.earliest_enter(edge, clock, reversed_dir)
+            enter = self.earliest_enter(edge, clock, reversed_dir, party_size)
             if enter is None:
                 raise NoRouteError("内部错误：获胜序列在重放时不可行")
             next_node = edge.src if reversed_dir else edge.dst
@@ -465,6 +567,7 @@ class RouteEngine:
         departure: int,
         avoid_stairs: bool,
         stops: tuple[Stop, ...],
+        party_size: int = 1,
     ) -> int:
         """第一阶段：完成全部停靠并抵达终点的最早时刻。
 
@@ -487,13 +590,13 @@ class RouteEngine:
             if k >= len(stops):
                 break
             stop = stops[k]
-            dist = self._earliest_arrival_map(current, clock, avoid_stairs)
+            dist = self._earliest_arrival_map(current, clock, avoid_stairs, party_size)
             if stop.node not in dist:
                 raise NoRouteError(f"无法到达第 {k + 1} 站（{stop.node}）{suffix}")
             clock = dist[stop.node]
             current = stop.node
         if current != destination:
-            dist = self._earliest_arrival_map(current, clock, avoid_stairs)
+            dist = self._earliest_arrival_map(current, clock, avoid_stairs, party_size)
             if destination not in dist:
                 raise NoRouteError(
                     "在当前步道图与封闭记录下不存在可行路线" + suffix
@@ -509,6 +612,7 @@ class RouteEngine:
         avoid_stairs: bool,
         stops: tuple[Stop, ...],
         deadline: int,
+        party_size: int = 1,
     ) -> tuple[str, ...]:
         """在“最终到达不晚于 deadline”的走法中取全程编号序列字典序最小者。
 
@@ -530,7 +634,7 @@ class RouteEngine:
                 continue  # 已被支配后移除的过期标签
 
             for edge, reversed_dir in self._options(u, avoid_stairs):
-                enter = self.earliest_enter(edge, t, reversed_dir)
+                enter = self.earliest_enter(edge, t, reversed_dir, party_size)
                 if enter is None:
                     continue
                 v = edge.src if reversed_dir else edge.dst
@@ -572,12 +676,13 @@ class RouteEngine:
         departure: int,
         avoid_stairs: bool,
         stops: tuple[Stop, ...],
+        party_size: int = 1,
     ) -> Route:
         deadline = self._earliest_final_with_stops(
-            origin, destination, departure, avoid_stairs, stops
+            origin, destination, departure, avoid_stairs, stops, party_size
         )
         best_seq = self._lex_smallest_with_stops(
-            origin, destination, departure, avoid_stairs, stops, deadline
+            origin, destination, departure, avoid_stairs, stops, deadline, party_size
         )
 
         # 按获胜序列重放，生成逐段时间与各站停靠记录
@@ -591,7 +696,7 @@ class RouteEngine:
         for edge_id in best_seq:
             edge = self._edges[edge_id]
             reversed_dir = current == edge.dst and current != edge.src
-            enter = self.earliest_enter(edge, clock, reversed_dir)
+            enter = self.earliest_enter(edge, clock, reversed_dir, party_size)
             if enter is None:
                 raise NoRouteError("内部错误：获胜序列在重放时不可行")
             next_node = edge.src if reversed_dir else edge.dst
@@ -691,5 +796,5 @@ class RouteEngine:
         )
 
 
-def build_engine(snapshot: Snapshot) -> RouteEngine:
-    return RouteEngine(snapshot)
+def build_engine(snapshot: Snapshot, occupancy: Optional[dict] = None) -> RouteEngine:
+    return RouteEngine(snapshot, occupancy)

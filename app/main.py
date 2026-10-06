@@ -9,11 +9,17 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import config
+from .booking import (
+    VersionConflictError,
+    cancel_trip_atomic,
+    confirm_trip_atomic,
+)
 from .db import (
     VersionNotFoundError,
     connect,
     current_version,
     get_snapshot,
+    get_trip,
     init_db,
     publish_closures,
     publish_graph,
@@ -145,10 +151,11 @@ async def version():
         init_db(conn)
         snap = get_snapshot(conn)
         if snap is None:
-            return {"data_version": 0, "nodes": 0, "edges": 0,
-                    "closures": 0, "reverse_windows": 0}
+            return {"data_version": 0, "generation_id": 0,
+                    "nodes": 0, "edges": 0, "closures": 0, "reverse_windows": 0}
         return {
             "data_version": snap.version_id,
+            "generation_id": snap.generation_id,
             "nodes": len(snap.nodes),
             "edges": len(snap.edges),
             "closures": len(snap.closures),
@@ -298,6 +305,172 @@ async def plan_meeting(request: Request):
             ],
             "data_version": snap.version_id,
         }
+    finally:
+        conn.close()
+
+
+def _capacity_for(snap, edge_id: str):
+    for edge in snap.edges:
+        if edge.id == edge_id:
+            return edge.capacity
+    return None
+
+
+def _trip_segment_to_dict(seg, capacity=None) -> dict:
+    return {
+        "edge_id": seg.edge_id,
+        "from_node": seg.from_node,
+        "to_node": seg.to_node,
+        "has_stairs": seg.has_stairs,
+        "enter_time": format_time(seg.enter_ts),
+        "enter_time_epoch": seg.enter_ts,
+        "leave_time": format_time(seg.leave_ts),
+        "leave_time_epoch": seg.leave_ts,
+        "travel_seconds": seg.travel_seconds,
+        "waiting_seconds": seg.waiting_seconds,
+        # 仅容量确认接口返回：该路段确认时的通行容量（null 表示不限）
+        "capacity": capacity,
+    }
+
+
+def _trip_to_dict(record, snap=None) -> dict:
+    result = {
+        "trip_id": record.trip_id,
+        "status": record.status,
+        "origin": record.origin,
+        "destination": record.destination,
+        "query_departure_time": format_time(record.departure_ts),
+        "query_departure_time_epoch": record.departure_ts,
+        "arrival_time": format_time(record.arrival_ts),
+        "arrival_time_epoch": record.arrival_ts,
+        "avoid_stairs": record.avoid_stairs,
+        "people": record.party_size,
+        "edge_sequence": [s.edge_id for s in record.segments],
+        "segments": [
+            _trip_segment_to_dict(
+                s, _capacity_for(snap, s.edge_id) if snap is not None else None
+            )
+            for s in record.segments
+        ],
+        "data_version": record.version_id,
+        "generation_id": record.generation_id,
+        "created_at_epoch": record.created_at,
+    }
+    if record.status == "cancelled":
+        result["cancelled_at_epoch"] = record.cancelled_at
+        if record.cancelled_at is not None:
+            result["cancelled_at"] = format_time(record.cancelled_at)
+    return result
+
+
+@app.post("/api/trips")
+async def confirm_trip(request: Request):
+    """确认有容量保障的行程：串行写事务内规划并原子写入，并发绝不超额。"""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_payload", "detail": "请求体必须是合法 JSON"}
+        )
+
+    conn = connect()
+    try:
+        init_db(conn)
+        # 负载校验在事务前完成（不触库），与既有接口的 400 口径一致
+        try:
+            current_snap = get_snapshot(conn)
+            if current_snap is None:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "no_data", "detail": "尚未导入步道图，请先调用导入接口"},
+                )
+            from .schemas import normalize_booking
+
+            query = normalize_booking(payload, current_snap.node_set)
+        except PayloadValidationError as exc:
+            return JSONResponse(
+                status_code=400, content={"error": "invalid_payload", "detail": str(exc)}
+            )
+
+        try:
+            record, snap = confirm_trip_atomic(
+                conn,
+                origin=query["origin"],
+                destination=query["destination"],
+                departure=query["departure"],
+                avoid_stairs=query["avoid_stairs"],
+                people=query["people"],
+                expected_version=query["expected_version"],
+            )
+        except VersionConflictError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "version_conflict",
+                    "detail": str(exc),
+                    "expected_version": exc.expected_version,
+                    "current_version": exc.current_version,
+                },
+            )
+        except NoRouteError as exc:
+            # 规划失败时事务已整体回滚，不留下任何占用
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "no_route",
+                    "detail": str(exc),
+                    "data_version": current_version(conn),
+                },
+            )
+        return JSONResponse(status_code=201, content=_trip_to_dict(record, snap))
+    finally:
+        conn.close()
+
+
+@app.get("/api/trips/{trip_id}")
+async def query_trip(trip_id: str):
+    """按编号查询已确认/已取消行程（逐段时刻与数据版本）。"""
+    if not trip_id.isdigit():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_payload", "detail": "行程编号必须是正整数"},
+        )
+    conn = connect()
+    try:
+        init_db(conn)
+        record = get_trip(conn, int(trip_id))
+        if record is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "trip_not_found", "detail": f"行程 {trip_id} 不存在"},
+            )
+        snap = get_snapshot(conn, record.version_id)
+        return _trip_to_dict(record, snap)
+    finally:
+        conn.close()
+
+
+@app.post("/api/trips/{trip_id}/cancel")
+async def cancel_trip(trip_id: str):
+    """取消已确认行程并释放容量；重复取消幂等，不重复释放。"""
+    if not trip_id.isdigit():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_payload", "detail": "行程编号必须是正整数"},
+        )
+    conn = connect()
+    try:
+        init_db(conn)
+        result = cancel_trip_atomic(conn, int(trip_id))
+        if result is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "trip_not_found", "detail": f"行程 {trip_id} 不存在"},
+            )
+        record, released = result
+        content = _trip_to_dict(record, get_snapshot(conn, record.version_id))
+        content["released"] = released
+        return content
     finally:
         conn.close()
 

@@ -380,6 +380,119 @@ def main() -> int:
     assert call("GET", "/version")[1]["data_version"] == v_back["data_version"]
     print("恢复拒绝：不存在版本 404、非法参数 400，生效版本均不变 ✔")
 
+    # 20. 容量确认（高峰行程）：示例图 E1/E3/E5 容量为 2，其余不限。
+    #     发布一张确定的容量图（新世代），用往返的半开占用验证串行确认。
+    cap_graph = {
+        "nodes": ["P", "Q", "R"],
+        "edges": [
+            {"id": "C1", "from": "P", "to": "Q", "travel_seconds": 120,
+             "has_stairs": False, "capacity": 2},
+            {"id": "C2", "from": "Q", "to": "R", "travel_seconds": 180,
+             "has_stairs": False, "capacity": 2},
+        ],
+    }
+    status, pub = call("POST", "/admin/graph", cap_graph)
+    assert status == 200, pub
+    gen_after_graph = call("GET", "/version")[1]["data_version"]
+
+    book = {
+        "origin": "P", "destination": "R",
+        "departure_time": "2026-10-06T08:00:00Z",
+        "avoid_stairs": False, "people": 2,
+    }
+    status, b1 = call("POST", "/api/trips", book, expect_status=201)
+    assert [s["edge_id"] for s in b1["segments"]] == ["C1", "C2"], b1
+    assert (b1["segments"][0]["enter_time"], b1["segments"][0]["capacity"]) == (
+        "2026-10-06T08:00:00Z", 2), b1
+    assert b1["generation_id"] == gen_after_graph, b1
+    print("容量确认 #1:", b1["trip_id"],
+          [s["enter_time"][11:19] for s in b1["segments"]])
+
+    # 同发第二单（各 2 人、容量 2）：半开占用串行，C1 须等到 08:02，C2 等到 08:05
+    status, b2 = call("POST", "/api/trips", book, expect_status=201)
+    assert [s["enter_time"][11:19] for s in b2["segments"]] == ["08:02:00", "08:05:00"], b2
+    assert b2["arrival_time"] == "2026-10-06T08:08:00Z", b2
+    print("容量确认 #2（容量不足节点等待）:",
+          [s["enter_time"][11:19] for s in b2["segments"]], "->", b2["arrival_time"][11:19])
+
+    # 人数超过容量（people=3 > 2，唯一路径）→ 404 no_route，且不留占用
+    status, full = call("POST", "/api/trips", {**book, "people": 3}, expect_status=404)
+    assert full["error"] == "no_route", full
+
+    # 负载非法 → 400 invalid_payload
+    for bad_book in ({**book, "people": 0}, {**book, "people": "2"},
+                     {**book, "departure_time": "nope"},
+                     {**book, "origin": "GHOST"}, {**book, "stops": []}):
+        status, bx = call("POST", "/api/trips", bad_book, expect_status=400)
+        assert bx["error"] == "invalid_payload", bx
+
+    # 数据版本过期 → 409 version_conflict，不写入
+    status, conflict = call("POST", "/api/trips",
+                            {**book, "data_version": b1["data_version"] - 1 or 1},
+                            expect_status=409)
+    assert conflict["error"] == "version_conflict", conflict
+    assert conflict["current_version"] == gen_after_graph, conflict
+    print("过期版本确认 → 409 version_conflict（不写入过时方案）")
+
+    # 携带当前版本可正常确认
+    status, b3 = call("POST", "/api/trips",
+                      {**book, "data_version": gen_after_graph}, expect_status=201)
+    assert b3["data_version"] == gen_after_graph, b3
+
+    # 按编号查询
+    status, got = call("GET", f"/api/trips/{b1['trip_id']}")
+    assert got["trip_id"] == b1["trip_id"] and got["status"] == "confirmed", got
+    assert got["people"] == 2 and len(got["segments"]) == 2, got
+    status, missing = call("GET", "/api/trips/999999", expect_status=404)
+    assert missing["error"] == "trip_not_found", missing
+    status, badid = call("GET", "/api/trips/xyz", expect_status=400)
+    assert badid["error"] == "invalid_payload", badid
+
+    # 取消：首次释放、重复取消幂等不重复释放
+    status, cancel1 = call("POST", f"/api/trips/{b1['trip_id']}/cancel")
+    assert cancel1["status"] == "cancelled" and cancel1["released"] is True, cancel1
+    status, cancel2 = call("POST", f"/api/trips/{b1['trip_id']}/cancel")
+    assert cancel2["released"] is False, cancel2
+    status, gotc = call("GET", f"/api/trips/{b1['trip_id']}")
+    assert gotc["status"] == "cancelled" and gotc["cancelled_at"], gotc
+    print("取消幂等：首次 released=true，重复取消 released=false，行程仍可查询")
+
+    # 容量已释放：同发新单可立即进入 C1（08:00 出发）
+    status, b4 = call("POST", "/api/trips", book, expect_status=201)
+    assert b4["segments"][0]["enter_time"] == "2026-10-06T08:00:00Z", b4
+
+    # 封闭记录更新：同世代继续计量（b2/b3/b4 仍占容量）
+    status, cp = call("POST", "/admin/closures", {"closures": []})
+    assert status == 200, cp
+    ver_same = call("GET", "/version")[1]["data_version"]
+    status, b5 = call("POST", "/api/trips",
+                      {**book, "data_version": ver_same}, expect_status=201)
+    # b2 占 C1[08:02,08:04)、b3 占 C1[08:04,08:06)、b4 占 C1[08:00,08:02)：
+    # 08:00 出发的新单须排到 08:06 进入 C1
+    assert b5["segments"][0]["enter_time"] == "2026-10-06T08:06:00Z", b5
+    print("封闭更新同世代：已确认行程继续计入容量，新单排队",
+          b5["segments"][0]["enter_time"][11:19])
+
+    # 重新发布图 → 新世代独立计量；旧行程仍可查询/取消
+    status, rep = call("POST", "/admin/graph", cap_graph)
+    assert status == 200, rep
+    assert rep["data_version"] != b2["generation_id"], rep
+    status, b6 = call("POST", "/api/trips", book, expect_status=201)
+    assert b6["segments"][0]["enter_time"] == "2026-10-06T08:00:00Z", b6
+    assert b6["generation_id"] != b2["generation_id"], b6
+    status, old_got = call("GET", f"/api/trips/{b2['trip_id']}")
+    assert old_got["status"] == "confirmed", old_got
+    status, old_cancel = call("POST", f"/api/trips/{b2['trip_id']}/cancel")
+    assert old_cancel["released"] is True, old_cancel
+    print("重新发布：新世代独立计量，旧行程仍可查询和取消 ✔")
+
+    # 普通路线查询语义不变：容量字段不出现在 /api/route 响应
+    status, plain = call("POST", "/api/route", {
+        "origin": "P", "destination": "R",
+        "departure_time": "2026-10-06T08:00:00Z"})
+    assert plain["edge_sequence"] == ["C1", "C2"], plain
+    assert "capacity" not in plain["segments"][0], plain
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

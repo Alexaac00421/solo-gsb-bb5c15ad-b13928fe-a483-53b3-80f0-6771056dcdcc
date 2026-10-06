@@ -42,6 +42,7 @@ def cmd_init_db(args) -> int:
         return 0
     if args.force:
         conn.executescript(
+            "DELETE FROM trip_segments; DELETE FROM trips; "
             "DELETE FROM closures; DELETE FROM reverse_windows; DELETE FROM edges; "
             "DELETE FROM nodes; DELETE FROM versions; "
             "UPDATE meta SET value='0' WHERE key='current_version';"

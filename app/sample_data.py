@@ -9,16 +9,20 @@
                  LAKE ──E5──── TOWER
 
 10:00–11:00 之间 E4 封闭施工。
+
+容量仅在**行程确认**（``POST /api/trips``）时生效，普通路线查询不感知：
+- E3、E5（平路主通道）高峰容量 20 人；
+- E1 容量 50 人；其余路段缺省不限。
 """
 
 SAMPLE_GRAPH = {
     "nodes": ["GATE", "PLAZA", "HILL", "LAKE", "TOWER"],
     "edges": [
-        {"id": "E1", "from": "GATE",  "to": "PLAZA", "travel_seconds": 180, "has_stairs": False},
+        {"id": "E1", "from": "GATE",  "to": "PLAZA", "travel_seconds": 180, "has_stairs": False, "capacity": 50},
         {"id": "E2", "from": "PLAZA", "to": "HILL",  "travel_seconds": 240, "has_stairs": True},
-        {"id": "E3", "from": "PLAZA", "to": "LAKE",  "travel_seconds": 300, "has_stairs": False},
+        {"id": "E3", "from": "PLAZA", "to": "LAKE",  "travel_seconds": 300, "has_stairs": False, "capacity": 20},
         {"id": "E4", "from": "HILL",  "to": "TOWER", "travel_seconds": 120, "has_stairs": True},
-        {"id": "E5", "from": "LAKE",  "to": "TOWER", "travel_seconds": 240, "has_stairs": False},
+        {"id": "E5", "from": "LAKE",  "to": "TOWER", "travel_seconds": 240, "has_stairs": False, "capacity": 20},
         {"id": "E6", "from": "PLAZA", "to": "TOWER", "travel_seconds": 600, "has_stairs": True},
     ],
 }

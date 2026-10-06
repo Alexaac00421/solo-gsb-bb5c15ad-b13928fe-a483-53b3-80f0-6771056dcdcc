@@ -1,16 +1,24 @@
 # 园区访客通行规划服务（Park Route Planner）
 
-面向园区访客的**离线**通行规划 HTTP 服务。导入一张带方向、通行秒数、台阶标记的
-步道图，以及按**半开时间区间** `[start, end)` 生效的封闭记录；给定起终点、出发
-时刻与是否避台阶，返回**最早到达**路线及逐段的进入、离开时间。路段还可携带
-**反向通行时间窗**数组：窗内仅允许从原终点走向原起点，窗外仅允许原方向，
+面向园区访客的**离线**通行规划 HTTP 服务。导入一张带方向、通行秒数、台阶标记、
+可选**通行容量**的步道图，以及按**半开时间区间** `[start, end)` 生效的封闭记录；
+给定起终点、出发时刻与是否避台阶，返回**最早到达**路线及逐段的进入、离开时间。
+路段还可携带**反向通行时间窗**数组：窗内仅允许从原终点走向原起点，窗外仅允许原方向，
 方向按进入路段的时刻判定，封闭记录对两个方向同样全程生效。支持在查询中
 指定**按顺序停靠的站点**（每站带开始停留时间窗与停留秒数），见第 4.1 节；
 也支持为**多名访客**在候选节点中选择公共汇合点，见第 4.2 节。导入前可用
-**联合预检**接口一次性校验候选步道图与封闭记录（含反向通行窗），返回
+**联合预检**接口一次性校验候选步道图与封闭记录（含反向通行窗、容量），返回
 全部可判定错误且不改动当前数据，见第 4.3 节。误发布后可用**版本恢复**
 把任一历史版本的节点、路段、封闭记录与反向通行窗整体恢复为新的生效版本
 （版本号继续递增，历史仍可追溯），见第 4.4 节。
+
+高峰时段可通过**行程确认**接口（第 4.5 节）为正整数人数的访客队伍原子确认
+一条**容量保障**行程：系统按每段实际进入至离开时间的半开区间占用路段容量，
+容量不足时自动在节点等待；成功原子写入行程并返回行程编号、逐段时刻、数据版本
+与图发布世代，并发确认绝不超额。行程可按编号查询、取消（取消幂等）；
+容量按图发布世代独立计量，重新发布图或恢复历史版本后新世代从空占用开始，
+旧世代行程仍可查询与取消。确认支持携带 `data_version` 做乐观版本校验，
+数据已变化时返回冲突而不写入过时方案。
 
 - 语言/存储：Python 3.11 + SQLite（标准库，无需外部数据库）
 - Web 框架：FastAPI + Uvicorn
@@ -83,6 +91,10 @@ python -m app.cli serve
   - `from` / `to`：起终点，必须引用已声明的节点；
   - `travel_seconds`：通行秒数，**正整数**；
   - `has_stairs`：是否含台阶（布尔）；
+  - `capacity`：**可选**，正整数通行容量（同时在路段上的人数上限）。
+    缺省或为 `null` 表示**不限制**。容量仅在行程确认
+    （`POST /api/trips`，见 4.5）时生效，普通路线查询
+    （`POST /api/route`）语义不变、不感知容量；
   - `reverse_windows`：**可选**，反向通行时间窗数组，缺省或为空
     （`[]`/`null`）时行为不变。每项为：
 
@@ -95,8 +107,23 @@ python -m app.cli serve
     （端点相接，如 `[a,b)` 与 `[b,c)`，允许）。
 
 示例见 [`data/graph.example.json`](data/graph.example.json)；
+带容量的示例见 [`data/graph.capacity.example.json`](data/graph.capacity.example.json)；
 带反向窗的示例见
 [`data/graph.reverse-windows.example.json`](data/graph.reverse-windows.example.json)。
+
+#### 容量语义
+
+- 每条带 `capacity` 的路段，任意时刻在该路段**上**的总人数不得超过容量；
+- 一次行程按队伍人数（`party_size`，正整数）整体占用每段的半开区间
+  `[enter_time, leave_time)`（即实际进入至离开时间）；同一边上多个
+  **未取消**行程的占用按半开区间叠加——区间端点相接
+  （`[a,b)` 与 `[b,c)`）不算同时占用；
+- 容量不足时允许在节点等待，系统自动把进入时刻推迟到拥堵结束；
+  人数本身超过路段容量时等待无济于事，该路段对本次请求不可用
+  （可能绕行或整体无可行行程）；
+- 容量等待与封闭等候、反向通行窗等待使用同一套最早进入机制：
+  等待封闭/拥堵可能越过窗边界，系统会重新判定可用方向；
+- 容量占用按**图发布世代**（generation）独立计量，详见 4.5 与第 6 节。
 
 #### 反向通行语义
 
@@ -473,6 +500,106 @@ curl -X POST http://localhost:8080/admin/restore \
 拒绝时响应体含 `"rejected": true` 与当前仍生效的 `active_version`，
 生效版本保持不变。
 
+### 4.5 容量保障行程（确认 / 查询 / 取消）
+
+高峰时段为一支**正整数人数**的访客队伍确认一条容量有保障的行程。
+封闭、反向通行窗、避台阶、节点等候、最早到达与全程编号字典序等规则
+与 `POST /api/route` 完全一致，额外叠加**路段容量**约束：容量不足时
+在节点等待，等待后仍遵循最早到达规则（可能改走绕行路线）。
+
+#### `POST /api/trips` — 确认行程（原子写入）
+
+请求：
+
+```json
+{
+  "origin": "GATE",
+  "destination": "TOWER",
+  "departure_time": "2026-10-05T09:55:00Z",
+  "avoid_stairs": false,
+  "party_size": 20,
+  "data_version": 2
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `origin` / `destination` | 起点、终点（必须是当前图已知节点） |
+| `departure_time` | 出发时刻（ISO 8601 或纪元秒） |
+| `avoid_stairs` | 是否避台阶（布尔，默认 `false`） |
+| `party_size` | **必填**，正整数人数（整队共同占用容量） |
+| `data_version` | **可选**，乐观版本校验：给出时必须是正整数；与当前生效版本不一致则拒绝写入（见下“版本冲突”） |
+
+响应 `201 Created`（结构与路线查询一致，另加行程管理字段）：
+
+```json
+{
+  "trip_id": 7,
+  "status": "confirmed",
+  "generation_id": 3,
+  "origin": "GATE",
+  "destination": "TOWER",
+  "departure_time": "2026-10-05T09:55:00Z",
+  "departure_time_epoch": 1791194100,
+  "arrival_time": "2026-10-05T10:11:00Z",
+  "arrival_time_epoch": 1791195060,
+  "avoid_stairs": false,
+  "party_size": 20,
+  "edge_sequence": ["E1", "E3", "E5"],
+  "segments": ["... 每段实际 enter/leave、travel_seconds、waiting_seconds ..."],
+  "data_version": 2
+}
+```
+
+- `trip_id`：行程编号，用于查询与取消；
+- `status`：`confirmed` / `cancelled`；
+- `generation_id`：确认时所属的**图发布世代**（容量计量口径）；
+- `data_version`：本次规划与写入实际使用的数据版本；
+- `segments[]` 的 `enter_time`/`leave_time` 即容量占用的半开区间端点，
+  `waiting_seconds` 含封闭、反向窗与容量三类节点等候。
+
+语义要点：
+
+- **原子确认**：版本校验 → 读取当前世代全部未取消占用 → 容量感知规划 →
+  写入行程与逐段记录，全部在同一个 `BEGIN IMMEDIATE` 写事务内完成；
+  并发确认经 SQLite 写锁串行提交，**不可能超额**；
+- **失败不留占用**：无可行行程（含人数超过沿途所有可选路线的容量）时
+  返回 `404 no_route`，事务回滚，不写入任何记录；
+- **世代计量**：容量只统计**同一图发布世代内未取消**行程的占用。
+  更新封闭记录不开新世代（占用继续计入）；重新发布步道图或恢复历史
+  版本开启递增的新世代，新世代从空占用开始独立计量，旧世代行程仍可
+  查询和取消（取消旧行程只影响旧世代，不影响新世代）；
+  `GET /version` 与 `GET /health` 返回当前 `generation_id`；
+- **版本冲突**：携带的 `data_version` 已不是当前生效版本时返回
+  `409 version_conflict`（含 `active_version`），不写入过时方案；
+  调用方应按新版本重新规划（重新查询/确认）后再提交。不带
+  `data_version` 时始终按当前版本规划确认。
+
+错误映射：
+
+| 场景 | 状态码 | `error` |
+| --- | --- | --- |
+| 字段非法（未知节点、时间格式错误、`party_size` 非正整数、`data_version` 非正整数等） | `400` | `invalid_payload` |
+| 无可行行程（不可达、避台阶后不可达、人数超过容量且无绕行、容量等待后仍无可行时间窗） | `404` | `no_route` |
+| 携带的 `data_version` 与当前生效版本不一致 | `409` | `version_conflict` |
+| 尚未导入步道图 | `503` | `no_data` |
+
+#### `GET /api/trips/{trip_id}` — 按编号查询行程
+
+已确认与**已取消**行程均可查询；响应结构同确认响应（取消行程
+`status` 为 `cancelled`）。行程不存在 → `404 trip_not_found`；
+编号非正整数 → `400 invalid_payload`。
+
+#### `POST /api/trips/{trip_id}/cancel` — 取消行程（幂等）
+
+把已确认行程置为 `cancelled`，其逐段容量占用立即不再计入所属世代；
+响应为更新后的行程，另带布尔字段 `cancelled_now`：本次实际完成取消
+为 `true`，行程此前已是取消状态（重复取消，**不重复释放**）为 `false`。
+行程不存在 → `404 trip_not_found`。
+
+> 行程确认不支持 `stops`（按顺序停靠）；带停靠的行程请先与管理方确认
+> 容量保障口径。普通路线查询的停靠语义保持不变。
+
 ### `POST /admin/graph` — 原子发布新步道图
 
 ```bash
@@ -507,9 +634,9 @@ curl -X POST http://localhost:8080/admin/closures \
 
 ### 其他
 
-- `GET /health`：健康检查与当前版本号；
-- `GET /version`：当前版本及节点/路段/封闭/反向窗数量
-  （`reverse_windows` 为反向时间窗总条数）。
+- `GET /health`：健康检查、当前版本号与图发布世代号；
+- `GET /version`：当前版本、图发布世代（`generation_id`）及节点/路段/
+  封闭/反向窗数量（`reverse_windows` 为反向时间窗总条数）。
 
 ---
 
@@ -648,8 +775,95 @@ curl -s -X POST http://localhost:8080/admin/restore \
   -H 'Content-Type: application/json' \
   -d '{"version": "2"}'
 
-# 冒烟自检（需服务已启动；内含反向窗导入/拒绝、窗内通行、联合预检与版本恢复检查）
+# 冒烟自检（需服务已启动；内含反向窗导入/拒绝、窗内通行、联合预检、
+# 版本恢复与容量行程确认/排队/取消/世代/版本冲突检查）
 python3 scripts/smoke_test.py http://localhost:8080
+```
+
+容量保障行程示例（第 4.5 节）：
+
+```bash
+# 先发布一条带容量的图：A -> B 通行 60 秒、容量 1 人
+curl -s -X POST http://localhost:8080/admin/graph \
+  -H 'Content-Type: application/json' \
+  -d '{"nodes":["A","B"],
+       "edges":[{"id":"Q1","from":"A","to":"B","travel_seconds":60,
+                 "has_stairs":false,"capacity":1}]}'
+
+# 确认第一批 1 人：立即进入 [500000000,500000060)，返回 201 与行程编号
+curl -s -X POST http://localhost:8080/api/trips \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"A","destination":"B","departure_time":500000000,
+       "avoid_stairs":false,"party_size":1}'
+
+# 同时出发的第二批：容量不足，自动在节点等到 500000060 进入
+curl -s -X POST http://localhost:8080/api/trips \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"A","destination":"B","departure_time":500000000,
+       "party_size":1}'
+# → segments[0].enter_time_epoch = 500000060，waiting_seconds = 60
+
+# 3 人队伍超过容量 1 → 404 no_route，且不留下任何占用
+curl -s -i -X POST http://localhost:8080/api/trips \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"A","destination":"B","departure_time":500000000,
+       "party_size":3}' | head -1
+
+# 按编号查询
+curl -s http://localhost:8080/api/trips/1
+
+# 取消（幂等）：首次 cancelled_now=true，重复取消 false，不重复释放
+curl -s -X POST http://localhost:8080/api/trips/1/cancel
+curl -s -X POST http://localhost:8080/api/trips/1/cancel
+
+# 乐观版本校验：携带过期 data_version → 409 version_conflict，不写入
+curl -s -i -X POST http://localhost:8080/api/trips \
+  -H 'Content-Type: application/json' \
+  -d '{"origin":"A","destination":"B","departure_time":500000000,
+       "party_size":1,"data_version":1}' | head -1
+```
+
+```python
+import json, urllib.error, urllib.request
+
+
+def post(path, body):
+    req = urllib.request.Request(
+        "http://localhost:8080" + path,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as e:
+        return e.code, json.load(e.read())
+
+
+# 1) 先取当前版本，确认时带上做乐观校验
+version = json.load(urllib.request.urlopen("http://localhost:8080/version"))
+status, trip = post("/api/trips", {
+    "origin": "A", "destination": "B",
+    "departure_time": "2026-10-05T09:55:00Z",
+    "avoid_stairs": False, "party_size": 20,
+    "data_version": version["data_version"],
+})
+if status == 201:
+    print("已确认行程", trip["trip_id"], "世代", trip["generation_id"])
+    for seg in trip["segments"]:
+        print(seg["edge_id"], seg["enter_time"], "->", seg["leave_time"])
+elif status == 409:
+    # 数据版本已变化：按响应中的 active_version 重新规划/确认
+    print("版本冲突，当前版本", trip["active_version"])
+elif status == 404:
+    print("无容量可行行程，已明确拒绝且无占用")
+
+# 2) 查询与取消
+print(json.load(urllib.request.urlopen(
+    "http://localhost:8080/api/trips/%d" % trip["trip_id"]))["status"])
+_, cancelled = post("/api/trips/%d/cancel" % trip["trip_id"], {})
+print(cancelled["status"], "cancelled_now =", cancelled["cancelled_now"])
 ```
 
 多人汇合点示例：
@@ -803,6 +1017,34 @@ print("来源版本:", result["source_version"],
   时间依赖 Dijkstra 与多标签选路无需改变；方向按进入时刻取定，重放获胜
   序列时按当时所在节点确定方向。反向窗无效或重叠时图导入在事务前校验
   失败，整次导入拒绝、旧版本保留。
+- **容量约束（行程确认）**：容量感知引擎在最早进入函数中除封闭、方向窗
+  之外再叠加容量判定——候选进入时刻对应通行区间
+  `[enter, enter + seconds)` 与同世代未取消行程的占用叠加后任一点超过
+  路段容量，则把进入时刻推迟到首个连续超额段结束（整数秒；半开区间端点
+  相接不算冲突），再重新判定封闭与方向窗。候选时刻只可能是就绪时刻、
+  既有占用的离开时刻、窗边界或封闭边界，函数仍关于就绪时刻单调非降
+  （FIFO），两阶段算法无需改变。人数超过路段容量时该方向直接不可用。
+  普通路线查询不传占用，容量完全不参与，语义与旧版一致。
+- **容量计量世代（generation）**：
+  - 世代号在 `meta` 中单独维护，首次发布图时为 1；
+  - **封闭记录更新不开新世代**——同一份图的封闭变更不影响容量口径，
+    更新前确认的未取消行程继续计入当前世代；
+  - **重新发布图或恢复历史版本开启递增新世代**——新世代初始没有任何
+    占用，新确认按新世代独立计量；旧世代的行程原样保留，仍可按编号
+    查询与取消（取消只释放其所属世代的占用，绝不影响新世代）；
+  - 每条行程持久化其确认时的 `generation_id` 与 `data_version`。
+- **原子确认与并发安全**：
+  - 每次行程确认在一个 SQLite 写事务（`BEGIN IMMEDIATE`）中完成版本
+    校验、占用读取、容量规划与行程写入；确认彼此、以及与图/封闭发布和
+    恢复之间全部串行提交，任一确认做规划时看到的占用集与其写入后的状态
+    严格一致，因此并发确认不可能超额；
+  - 规划失败（无可行路线）时事务整体回滚，不写入行程、不留下占用；
+  - 取消只做状态翻转（`confirmed → cancelled`）且在写事务内进行，
+    重复取消为幂等读操作，不会重复释放容量。
+- **乐观版本校验**：确认请求可携带 `data_version`；它在写事务内与当前
+    生效版本比较，不一致即抛冲突并回滚（`409 version_conflict`），
+    因此绝不会基于过时图/封闭数据写入方案；调用方应读取响应中的
+    `active_version`，基于新版本重新规划后再确认。
 - **原子发布与版本一致**：
   - 每次导入（图或封闭）在一个 SQLite 写事务中完成全部校验、复制与版本指针切换，
     失败整体回滚；
@@ -824,16 +1066,16 @@ print("来源版本:", result["source_version"],
 app/
   config.py        # 环境变量配置
   timeutil.py      # ISO 8601 <-> 纪元秒（UTC）
-  schemas.py       # 导入/查询负载校验（含停靠点 stops、多人汇合 meeting、反向窗）
+  schemas.py       # 导入/查询/行程确认负载校验（含 stops、meeting、反向窗、容量）
   precheck.py      # 联合预检：候选图+封闭记录只读批量校验（收集全部错误及位置）
-  db.py            # SQLite 版本化与原子发布
-  routing.py       # 时间依赖最短路 + 字典序选路引擎（含按顺序停靠、多人汇合、反向窗）
+  db.py            # SQLite 版本化、原子发布、图发布世代与行程持久层
+  routing.py       # 时间依赖最短路 + 字典序选路引擎（停靠、汇合、反向窗、容量）
   main.py          # FastAPI 路由
   sample_data.py   # 内置示例数据
   cli.py           # init-db / import-* / restore / serve
 data/              # 示例 JSON 与本地数据库
 scripts/smoke_test.py
-tests/             # 标准库 unittest 测试（147 个用例）
+tests/             # 标准库 unittest 测试（190 个用例）
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh
@@ -849,6 +1091,12 @@ python3 -m unittest discover -s tests -v
 按顺序停靠（窗口等待、顺序约束、全程字典序、起点/终点即站点）、
 多人汇合（候选筛选、汇合时刻/抵达总和/节点编号三级择优、到达后等待、
 逐人避台阶与出发时刻、负载校验）、
+容量保障（半开占用叠加与端点相接、容量不足节点等待、carry-in 占用、
+碎片化与多段拥堵迭代等待、人数超容量不可达、绕行/等待择优、多跳排队、
+容量与封闭/反向窗/避台阶/字典序组合、容量字段校验）、
+行程生命周期（原子确认与逐段时刻、并发确认不超额、查询、取消幂等与
+容量只释放一次、拒绝不留占用、乐观版本冲突不写入、封闭更新同世代计量、
+重新发布图与版本恢复开新世代且旧行程可查可取消、容量随版本持久化）、
 反向时间窗（进入时刻判定方向、途中跨窗边界走完、半开边界、
 封闭对两方向的全程约束、等窗/等封闭、多窗相接与等待下一窗、
 避台阶、与停靠/汇合/字典序平局的组合、逐段实际方向、

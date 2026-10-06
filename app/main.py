@@ -10,10 +10,15 @@ from fastapi.responses import JSONResponse
 
 from . import config
 from .db import (
+    StaleVersionError,
     VersionNotFoundError,
+    cancel_trip,
+    confirm_trip,
     connect,
+    current_generation,
     current_version,
     get_snapshot,
+    get_trip,
     init_db,
     publish_closures,
     publish_graph,
@@ -69,7 +74,7 @@ def _route_to_dict(route) -> dict:
         "query_departure_time_epoch": route.departure_time,
         "arrival_time": format_time(route.arrival_time),
         "arrival_time_epoch": route.arrival_time,
-        # 等候 = 非通行、非停留时间（封闭等候 + 等窗口开放）
+        # 等候 = 非通行、非停留时间（封闭等候 + 等窗口开放 + 容量等候）
         "total_waiting_seconds": route.arrival_time
         - route.departure_time
         - sum(s.travel_seconds for s in route.segments)
@@ -83,6 +88,54 @@ def _route_to_dict(route) -> dict:
         result["stops"] = [_stop_to_dict(v) for v in route.stops]
         result["total_stay_seconds"] = total_stay
     return result
+
+
+def _trip_segment_to_dict(seg, edges_by_id: dict) -> dict:
+    """持久层行程逐段记录 -> 与路线查询一致结构的 JSON。
+
+    行程版本的图中仍有该路段时补全 travel_seconds/has_stairs 与等候秒数；
+    路段在当前版本已不存在时只返回持久化的字段。
+    """
+    result = {
+        "edge_id": seg.edge_id,
+        "from_node": seg.from_node,
+        "to_node": seg.to_node,
+        "enter_time": format_time(seg.enter),
+        "enter_time_epoch": seg.enter,
+        "leave_time": format_time(seg.leave),
+        "leave_time_epoch": seg.leave,
+    }
+    edge = edges_by_id.get(seg.edge_id)
+    if edge is not None:
+        result["travel_seconds"] = edge.seconds
+        result["has_stairs"] = edge.has_stairs
+    result["waiting_seconds"] = None
+    return result
+
+
+def _trip_to_dict(trip, edges_by_id: dict) -> dict:
+    segments = [_trip_segment_to_dict(s, edges_by_id) for s in trip.segments]
+    # waiting_seconds = 本段进入时刻 - 上一段离开时刻（首段相对出发时刻）
+    prev_leave = trip.departure
+    for seg, raw in zip(segments, trip.segments):
+        seg["waiting_seconds"] = raw.enter - prev_leave
+        prev_leave = raw.leave
+    return {
+        "trip_id": trip.trip_id,
+        "status": trip.status,
+        "generation_id": trip.generation_id,
+        "origin": trip.origin,
+        "destination": trip.destination,
+        "departure_time": format_time(trip.departure),
+        "departure_time_epoch": trip.departure,
+        "arrival_time": format_time(trip.arrival),
+        "arrival_time_epoch": trip.arrival,
+        "avoid_stairs": trip.avoid_stairs,
+        "party_size": trip.party_size,
+        "edge_sequence": [s.edge_id for s in trip.segments],
+        "segments": segments,
+        "data_version": trip.version_id,
+    }
 
 
 def _maybe_seed(conn) -> None:
@@ -133,7 +186,12 @@ async def health():
     try:
         init_db(conn)
         version = current_version(conn)
-        return {"status": "ok", "data_version": version, "has_data": version != 0}
+        return {
+            "status": "ok",
+            "data_version": version,
+            "generation_id": current_generation(conn),
+            "has_data": version != 0,
+        }
     finally:
         conn.close()
 
@@ -143,12 +201,15 @@ async def version():
     conn = connect()
     try:
         init_db(conn)
+        from .db import current_generation
+
         snap = get_snapshot(conn)
         if snap is None:
-            return {"data_version": 0, "nodes": 0, "edges": 0,
-                    "closures": 0, "reverse_windows": 0}
+            return {"data_version": 0, "generation_id": current_generation(conn),
+                    "nodes": 0, "edges": 0, "closures": 0, "reverse_windows": 0}
         return {
             "data_version": snap.version_id,
+            "generation_id": current_generation(conn),
             "nodes": len(snap.nodes),
             "edges": len(snap.edges),
             "closures": len(snap.closures),
@@ -298,6 +359,139 @@ async def plan_meeting(request: Request):
             ],
             "data_version": snap.version_id,
         }
+    finally:
+        conn.close()
+
+
+def _load_trip_view(conn, trip_id: int):
+    """读取行程并用其确认时版本的图补全逐段字段；行程不存在返回 None。"""
+    trip = get_trip(conn, trip_id)
+    if trip is None:
+        return None
+    snap = get_snapshot(conn, trip.version_id)
+    edges_by_id = {e.id: e for e in snap.edges} if snap is not None else {}
+    return _trip_to_dict(trip, edges_by_id)
+
+
+def _parse_trip_id(raw: str):
+    """解析路径中的行程编号：纯数字组成的正整数（拒绝 ``0``、小数等）。"""
+    from .schemas import ValidationError
+
+    if not isinstance(raw, str) or not raw.isdigit() or int(raw) <= 0:
+        raise ValidationError("行程编号必须是正整数")
+    return int(raw)
+
+
+@app.post("/api/trips")
+async def create_trip(request: Request):
+    """确认一条容量保障行程。
+
+    在单个写事务内完成版本校验 → 基于当前世代未取消占用的容量规划 →
+    原子写入；并发确认经 SQLite 写事务串行化，不可能超额。规划失败时
+    事务回滚，不留下任何占用。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400, content={"error": "invalid_payload", "detail": "请求体必须是合法 JSON"}
+        )
+
+    conn = connect()
+    try:
+        init_db(conn)
+        from .schemas import normalize_trip_request
+
+        # 先在当前版本上校验负载（节点引用等），再进入写事务
+        snap = get_snapshot(conn)
+        if snap is None:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "no_data", "detail": "尚未导入步道图，请先调用导入接口"},
+            )
+        try:
+            trip_req = normalize_trip_request(payload, snap.node_set)
+        except PayloadValidationError as exc:
+            return JSONResponse(
+                status_code=400, content={"error": "invalid_payload", "detail": str(exc)}
+            )
+
+        from .routing import NoRouteError
+
+        try:
+            trip = confirm_trip(conn, trip_req)
+        except StaleVersionError as exc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "version_conflict",
+                    "detail": str(exc),
+                    "rejected": True,
+                    "active_version": current_version(conn),
+                },
+            )
+        except NoRouteError as exc:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "no_route",
+                    "detail": str(exc),
+                    "data_version": current_version(conn),
+                },
+            )
+
+        result = _load_trip_view(conn, trip.trip_id)
+        return JSONResponse(status_code=201, content=result)
+    finally:
+        conn.close()
+
+
+@app.get("/api/trips/{trip_id}")
+async def read_trip(trip_id: str):
+    """按编号查询已确认行程（已取消行程也可查询）。"""
+    conn = connect()
+    try:
+        init_db(conn)
+        try:
+            tid = _parse_trip_id(trip_id)
+        except PayloadValidationError as exc:
+            return JSONResponse(
+                status_code=400, content={"error": "invalid_payload", "detail": str(exc)}
+            )
+        result = _load_trip_view(conn, tid)
+        if result is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "trip_not_found", "detail": f"行程 {tid} 不存在"},
+            )
+        return result
+    finally:
+        conn.close()
+
+
+@app.post("/api/trips/{trip_id}/cancel")
+async def cancel(trip_id: str):
+    """取消已确认行程（幂等：重复取消不重复释放容量）。"""
+    conn = connect()
+    try:
+        init_db(conn)
+        try:
+            tid = _parse_trip_id(trip_id)
+        except PayloadValidationError as exc:
+            return JSONResponse(
+                status_code=400, content={"error": "invalid_payload", "detail": str(exc)}
+            )
+        existing = get_trip(conn, tid)
+        if existing is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "trip_not_found", "detail": f"行程 {tid} 不存在"},
+            )
+        already_cancelled = existing.status == "cancelled"
+        trip = cancel_trip(conn, tid)  # 幂等：内部仅在 confirmed 时更新
+        result = _load_trip_view(conn, tid)
+        result["cancelled_now"] = not already_cancelled
+        return result
     finally:
         conn.close()
 

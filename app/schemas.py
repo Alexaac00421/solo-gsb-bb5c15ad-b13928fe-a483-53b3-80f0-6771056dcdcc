@@ -36,6 +36,25 @@ def _validate_seconds(value: Any) -> int:
     return value
 
 
+def _validate_capacity(value: Any, where: str) -> int:
+    """校验路段通行容量：缺省/None 不限制；否则必须为正整数。"""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{where}.capacity 必须是正整数或缺省(不限)")
+    if value <= 0:
+        raise ValidationError(f"{where}.capacity 必须为正整数，收到 {value}")
+    return value
+
+
+def _validate_party_size(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError("人数(party_size)必须是正整数")
+    if value <= 0:
+        raise ValidationError(f"人数(party_size)必须为正整数，收到 {value}")
+    return value
+
+
 def _validate_stairs(value: Any) -> bool:
     if not isinstance(value, bool):
         raise ValidationError("台阶标记(has_stairs)必须是布尔值 true/false")
@@ -140,6 +159,9 @@ def normalize_graph(payload: Any) -> dict:
             raise ValidationError(f"{where} 缺少 travel_seconds")
         seconds = _validate_seconds(raw["travel_seconds"])
         has_stairs = _validate_stairs(raw.get("has_stairs", False))
+        # 通行容量：缺省或 null 表示不限制
+        capacity = _validate_capacity(raw.get("capacity"), where) \
+            if "capacity" in raw else None
 
         # 反向通行时间窗：缺省（None）与空数组都表示全程仅允许原方向
         reverse_windows: list[tuple[int, int]] = []
@@ -156,6 +178,7 @@ def normalize_graph(payload: Any) -> dict:
                 "seconds": seconds,
                 "has_stairs": has_stairs,
                 "reverse_windows": reverse_windows,
+                "capacity": capacity,
             }
         )
 
@@ -403,4 +426,60 @@ def normalize_query(payload: Any, node_set: set[str]) -> dict:
         "departure": departure,
         "avoid_stairs": avoid_stairs,
         "stops": stops,
+    }
+
+
+def normalize_trip_request(payload: Any, node_set: set[str]) -> dict:
+    """校验一次行程确认请求负载。
+
+    期望格式::
+
+        {"origin": "GATE", "destination": "TOWER",
+         "departure_time": "2026-10-05T09:00:00Z",
+         "avoid_stairs": false,
+         "party_size": 12,
+         "data_version": 3}          # 可选：乐观版本校验
+
+    与 :func:`normalize_query` 的字段口径一致（不含停靠点），额外要求
+    正整数 ``party_size``；``data_version`` 缺省表示不校验，给定时必须
+    为正整数版本号，与当前生效版本不一致时由持久层拒绝写入。
+    """
+    data = _require_object(payload, "行程确认请求")
+    for field in ("origin", "destination", "departure_time", "party_size"):
+        if field not in data:
+            raise ValidationError(f"缺少必填字段: {field}")
+
+    origin = _clean_identifier(data.get("origin"), "origin")
+    destination = _clean_identifier(data.get("destination"), "destination")
+    for name, node in (("origin", origin), ("destination", destination)):
+        if node not in node_set:
+            raise ValidationError(f"{name} 引用了未知节点: {node!r}")
+
+    try:
+        departure = parse_time(data["departure_time"])
+    except TimeError as exc:
+        raise ValidationError(f"departure_time: {exc}") from None
+
+    avoid_stairs = data.get("avoid_stairs", False)
+    if not isinstance(avoid_stairs, bool):
+        raise ValidationError("avoid_stairs 必须是布尔值 true/false")
+
+    party_size = _validate_party_size(data["party_size"])
+
+    expected_version = None
+    if data.get("data_version") is not None:
+        value = data["data_version"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValidationError("data_version 必须是正整数版本号")
+        if value <= 0:
+            raise ValidationError(f"data_version 必须是正整数版本号，收到 {value}")
+        expected_version = value
+
+    return {
+        "origin": origin,
+        "destination": destination,
+        "departure": departure,
+        "avoid_stairs": avoid_stairs,
+        "party_size": party_size,
+        "expected_version": expected_version,
     }

@@ -380,6 +380,106 @@ def main() -> int:
     assert call("GET", "/version")[1]["data_version"] == v_back["data_version"]
     print("恢复拒绝：不存在版本 404、非法参数 400，生效版本均不变 ✔")
 
+    # 20. 容量保障行程：发布容量瓶颈图（A->B 60 秒，容量 1），
+    #     与既有版本完全独立，验证后恢复回冒烟前版本
+    ver_before = call("GET", "/version")[1]
+    status, cap_pub = call("POST", "/admin/graph", {
+        "nodes": ["A", "B"],
+        "edges": [{"id": "Q1", "from": "A", "to": "B",
+                   "travel_seconds": 60, "has_stairs": False, "capacity": 1}],
+    })
+    assert status == 200, cap_pub
+    assert call("GET", "/version")[1]["generation_id"] == ver_before["generation_id"] + 1
+
+    base_ts = 500_000_000  # 与其他冒烟数据时间不相交
+    status, tr1 = call("POST", "/api/trips", {
+        "origin": "A", "destination": "B", "departure_time": base_ts,
+        "avoid_stairs": False, "party_size": 1}, expect_status=201)
+    assert status == 201 and tr1["status"] == "confirmed", tr1
+    assert tr1["segments"][0]["enter_time_epoch"] == base_ts, tr1
+    tid1 = tr1["trip_id"]
+
+    # 第二、三批因容量排队（半开区间首尾相接）
+    _, tr2 = call("POST", "/api/trips", {
+        "origin": "A", "destination": "B", "departure_time": base_ts,
+        "party_size": 1}, expect_status=201)
+    _, tr3 = call("POST", "/api/trips", {
+        "origin": "A", "destination": "B", "departure_time": base_ts,
+        "party_size": 1}, expect_status=201)
+    assert tr2["segments"][0]["enter_time_epoch"] == base_ts + 60, tr2
+    assert tr3["segments"][0]["enter_time_epoch"] == base_ts + 120, tr3
+
+    # 人数超过容量 → 404 no_route，不留占用
+    status, over = call("POST", "/api/trips", {
+        "origin": "A", "destination": "B", "departure_time": base_ts,
+        "party_size": 2}, expect_status=404)
+    assert over["error"] == "no_route", over
+
+    # 按编号查询 / 未知编号 404 / 非法编号 400
+    _, got = call("GET", f"/api/trips/{tid1}")
+    assert got["segments"][0]["edge_id"] == "Q1" and got["party_size"] == 1, got
+    call("GET", "/api/trips/99999999", expect_status=404)
+    call("GET", "/api/trips/abc", expect_status=400)
+
+    # 取消幂等：cancelled_now 首次 True、重复 False，容量只释放一次
+    _, canc = call("POST", f"/api/trips/{tid1}/cancel")
+    assert canc["status"] == "cancelled" and canc["cancelled_now"] is True, canc
+    _, canc2 = call("POST", f"/api/trips/{tid1}/cancel")
+    assert canc2["status"] == "cancelled" and canc2["cancelled_now"] is False, canc2
+    # 已取消行程仍可查询
+    assert call("GET", f"/api/trips/{tid1}")[1]["status"] == "cancelled"
+    # 释放出的槽位可立即使用
+    _, refill = call("POST", "/api/trips", {
+        "origin": "A", "destination": "B", "departure_time": base_ts,
+        "party_size": 1}, expect_status=201)
+    assert refill["segments"][0]["enter_time_epoch"] == base_ts, refill
+    # 取消不存在行程 → 404
+    call("POST", "/api/trips/99999999/cancel", expect_status=404)
+    print("容量行程：排队确认/查询/取消幂等/容量释放 全部正确 ✔")
+
+    # 乐观版本校验：过期 data_version → 409 version_conflict，不写入
+    status, conflict = call("POST", "/api/trips", {
+        "origin": "A", "destination": "B", "departure_time": base_ts,
+        "party_size": 1, "data_version": ver_before["data_version"]},
+        expect_status=409)
+    assert conflict["error"] == "version_conflict", conflict
+    assert conflict["active_version"] == cap_pub["data_version"], conflict
+    _, tr_current = call("POST", "/api/trips", {
+        "origin": "A", "destination": "B", "departure_time": base_ts,
+        "party_size": 1, "data_version": cap_pub["data_version"]},
+        expect_status=201)
+    assert tr_current["status"] == "confirmed", tr_current
+    print("容量行程：版本冲突 409、当前版本确认成功 ✔")
+
+    # 普通路线查询语义不变：不感知容量占用
+    _, plain = call("POST", "/api/route", {
+        "origin": "A", "destination": "B", "departure_time": base_ts})
+    assert plain["segments"][0]["enter_time_epoch"] == base_ts, plain
+    assert plain["segments"][0]["waiting_seconds"] == 0, plain
+
+    # 容量字段校验：0/负数/字符串拒绝；预检同样报错
+    for bad_cap in (0, -1, "1"):
+        status, bad = call("POST", "/admin/graph", {
+            "nodes": ["A", "B"],
+            "edges": [{"id": "Q1", "from": "A", "to": "B",
+                       "travel_seconds": 60, "has_stairs": False,
+                       "capacity": bad_cap}]}, expect_status=400)
+        assert bad["error"] == "invalid_payload", bad
+    _, pre = call("POST", "/admin/precheck", {
+        "graph": {"nodes": ["A", "B"], "edges": [
+            {"id": "Q1", "from": "A", "to": "B", "travel_seconds": 60,
+             "has_stairs": False, "capacity": 0}]},
+        "closures": {"closures": []}})
+    assert pre["ok"] is False and pre["errors"][0]["path"] == "edges[0].capacity", pre
+
+    # 恢复冒烟前版本：恢复也开启新世代；容量行程仍可查询
+    status, restored_back = call("POST", "/admin/restore",
+                                 {"version": ver_before["data_version"]})
+    assert status == 200 and restored_back["source_version"] == ver_before["data_version"]
+    assert call("GET", "/api/trips/%d" % tid1)[1]["status"] == "cancelled"
+    assert call("GET", "/version")[1]["closures"] == ver_before["closures"]
+    print("容量行程：恢复后旧行程仍可查询，图数据恢复原样 ✔")
+
     if failures:
         print("\n".join("FAIL: " + f for f in failures), file=sys.stderr)
         return 1

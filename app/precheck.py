@@ -16,6 +16,7 @@ from typing import Any, Optional
 from .schemas import (
     ValidationError,
     _clean_identifier,
+    _validate_capacity,
     _validate_seconds,
     _validate_stairs,
 )
@@ -159,6 +160,13 @@ def collect_graph_errors(payload: Any) -> tuple[list[dict], Optional[dict]]:
             except ValidationError as exc:
                 _add(errors, source, f"{where}.has_stairs", i, str(exc))
 
+            capacity = None
+            if "capacity" in raw:
+                try:
+                    capacity = _validate_capacity(raw.get("capacity"), where)
+                except ValidationError as exc:
+                    _add(errors, source, f"{where}.capacity", i, str(exc))
+
             windows = _collect_reverse_windows(errors, raw, where, i)
 
             edges.append(
@@ -169,6 +177,7 @@ def collect_graph_errors(payload: Any) -> tuple[list[dict], Optional[dict]]:
                     "seconds": seconds,
                     "has_stairs": has_stairs,
                     "reverse_windows": windows,
+                    "capacity": capacity,
                 }
             )
 
